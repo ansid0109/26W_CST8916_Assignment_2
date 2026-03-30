@@ -175,7 +175,10 @@ def track():
         "product_id": request.json.get("product_id"),
         "user_id":    request.json.get("user_id", "anonymous"),
         "timestamp":  datetime.now(timezone.utc).isoformat(),
-        "deviceType": request.headers.get("Sec-CH-UA-Mobile") or request.user_agent.platform or "unknown",
+        "deviceType": determine_device_type(
+            request.headers.get("User-Agent") or "",
+            request.headers.get("Sec-CH-UA-Mobile") or ""
+        ),
         "browser":    request.headers.get("Sec-CH-UA") or request.user_agent.browser or "unknown",
         "os":         request.headers.get("Sec-CH-UA-Platform") or request.user_agent.platform or "unknown",
     }
@@ -219,6 +222,16 @@ def get_events():
         summary[et] = summary.get(et, 0) + 1
 
     return jsonify({"events": recent, "summary": summary, "total": len(recent)}), 200
+
+
+def determine_device_type(ua, ch_mobile):
+    if ch_mobile in ("?1", "1", "true"):
+        device_type = "mobile"
+    elif any(t in ua for t in ("ipad", "tablet", "kindle", "silk", "playbook")):
+        device_type = "tablet"
+    else:
+        device_type = "desktop"
+    return device_type
 
 
 # ---------------------------------------------------------------------------
