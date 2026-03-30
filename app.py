@@ -175,6 +175,9 @@ def track():
         "product_id": request.json.get("product_id"),
         "user_id":    request.json.get("user_id", "anonymous"),
         "timestamp":  datetime.now(timezone.utc).isoformat(),
+        "deviceType": request.user_agent.platform or "unknown",
+        "browser":    request.user_agent.browser or "unknown",
+        "os":         request.user_agent.platform or "unknown",
     }
 
     send_to_event_hubs(event)
