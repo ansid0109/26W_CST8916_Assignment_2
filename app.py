@@ -50,6 +50,8 @@ _event_buffer = []
 _device_event_buffer = []
 _traffic_event_buffer = []
 _buffer_lock = threading.Lock()
+_consumer_start_lock = threading.Lock()
+_consumers_started = False
 MAX_BUFFER = 50
 
 
@@ -237,6 +239,27 @@ def start_consumers():
     _start_consumer_for_hub(TRAFFIC_EVENT_HUB_NAME, _on_traffic_event, "traffic-spike")
 
 
+def ensure_consumers_started():
+    """Start consumers once per worker process (works for Gunicorn/App Service)."""
+    global _consumers_started
+    if _consumers_started:
+        return
+
+    with _consumer_start_lock:
+        if _consumers_started:
+            return
+        app.logger.info("Starting Event Hubs consumers in worker pid=%s", os.getpid())
+        start_consumers()
+        _consumers_started = True
+        app.logger.info("Event Hubs consumers ready in worker pid=%s", os.getpid())
+
+
+@app.before_request
+def _bootstrap_background_consumers():
+    """Ensure consumers are running before serving app routes."""
+    ensure_consumers_started()
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -257,6 +280,32 @@ def dashboard():
 def health():
     """Health check – used by Azure App Service to verify the app is running."""
     return jsonify({"status": "healthy"}), 200
+
+
+@app.route("/api/consumer-status", methods=["GET"])
+def consumer_status():
+    """Diagnostic status for background consumers in the current worker."""
+    with _buffer_lock:
+        click_count = len(_event_buffer)
+        device_count = len(_device_event_buffer)
+        traffic_count = len(_traffic_event_buffer)
+
+    return jsonify(
+        {
+            "pid": os.getpid(),
+            "consumers_started": _consumers_started,
+            "buffers": {
+                "clickstream": click_count,
+                "device": device_count,
+                "traffic": traffic_count,
+            },
+            "hubs": {
+                "clickstream": CLICK_EVENT_HUB_NAME,
+                "device": DEVICE_EVENT_HUB_NAME,
+                "traffic": TRAFFIC_EVENT_HUB_NAME,
+            },
+        }
+    ), 200
 
 
 @app.route("/track", methods=["POST"])
@@ -383,6 +432,6 @@ def determine_device_type(ua, ch_mobile):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     # Start the background consumer so the dashboard receives live events
-    start_consumers()
+    ensure_consumers_started()
     # Run on 0.0.0.0 so it is reachable both locally and inside Azure App Service
     app.run(debug=False, host="0.0.0.0", port=8000)
