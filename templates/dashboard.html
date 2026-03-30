@@ -108,6 +108,43 @@
     .bar-fill  { height: 100%; background: #1f6feb; border-radius: 4px; transition: width 0.4s ease; }
     .bar-count { width: 30px; text-align: right; font-size: 0.85rem; color: #8b949e; }
 
+    .meta {
+      margin-top: 10px;
+      color: #8b949e;
+      font-size: 0.78rem;
+    }
+
+    .spike-box {
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 14px;
+      background: #0d1117;
+      margin-bottom: 14px;
+    }
+    .spike-title { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; }
+    .spike-value { font-size: 1.9rem; font-weight: 700; margin-top: 6px; }
+    .spike-value.safe { color: #3fb950; }
+    .spike-value.alert { color: #f85149; }
+    .spike-sub { margin-top: 6px; color: #8b949e; font-size: 0.8rem; }
+
+    .tiny-list {
+      max-height: 120px;
+      overflow-y: auto;
+      font-family: "Courier New", monospace;
+      font-size: 0.75rem;
+      color: #c9d1d9;
+      border-top: 1px solid #21262d;
+      padding-top: 8px;
+    }
+    .tiny-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 4px 0;
+      border-bottom: 1px solid #161b22;
+    }
+    .tiny-row:last-child { border-bottom: none; }
+
     /* ── Event feed ─────────────────────────────────────────── */
     #feed {
       font-family: "Courier New", monospace;
@@ -197,10 +234,32 @@
     </div>
   </div>
 
+  <!-- Device type breakdown -->
+  <div class="panel" style="max-width:400px;">
+    <h3>Device Type (Latest Window)</h3>
+    <div id="device-chart">
+      <p style="color:#484f58; font-size:0.85rem;">Waiting for device insights...</p>
+    </div>
+    <div class="meta" id="device-window-meta">Window: –</div>
+  </div>
+
+  <!-- Traffic spike status -->
+  <div class="panel" style="max-width:400px;">
+    <h3>Traffic Spike Detection</h3>
+    <div class="spike-box">
+      <div class="spike-title">Latest Window Count</div>
+      <div class="spike-value" id="traffic-count">–</div>
+      <div class="spike-sub" id="traffic-meta">Window: – | Threshold: –</div>
+    </div>
+    <div class="tiny-list" id="traffic-recent">
+      <p style="color:#484f58;">Waiting for traffic windows...</p>
+    </div>
+  </div>
+
 </div>
 
 <footer>
-  Polling <code>/api/events</code> every 2 seconds &nbsp;|&nbsp;
+  Polling <code>/api/events</code> and <code>/api/insights</code> every 2 seconds &nbsp;|&nbsp;
   Events consumed from Azure Event Hubs &nbsp;|&nbsp;
   CST8916 Week 10 Lab
 </footer>
@@ -219,12 +278,16 @@
   };
 
   function fetchAndRender() {
-    fetch("/api/events?limit=50")
-      .then(res => res.json())
-      .then(data => {
-        renderKPIs(data);
-        renderBarChart(data.summary);
-        renderFeed(data.events);
+    Promise.all([
+      fetch("/api/events?limit=50").then(res => res.json()),
+      fetch("/api/insights?limit=50").then(res => res.json()),
+    ])
+      .then(([eventsData, insightsData]) => {
+        renderKPIs(eventsData);
+        renderBarChart(eventsData.summary);
+        renderFeed(eventsData.events);
+        renderDeviceBreakdown(insightsData.device_breakdown);
+        renderTrafficSpike(insightsData.traffic_spike, insightsData.traffic_events || []);
       })
       .catch(err => console.error("Poll error:", err));
   }
@@ -280,6 +343,66 @@
         <span class="feed-user">${(e.user_id || "–").slice(0, 8)}</span>
       `;
       feed.appendChild(row);
+    });
+  }
+
+  function renderDeviceBreakdown(deviceBreakdown) {
+    const container = document.getElementById("device-chart");
+    const meta = document.getElementById("device-window-meta");
+    const breakdown = deviceBreakdown?.breakdown || {};
+
+    container.innerHTML = "";
+    if (Object.keys(breakdown).length === 0) {
+      container.innerHTML = '<p style="color:#484f58; font-size:0.85rem;">No device window received yet.</p>';
+      meta.textContent = "Window: -";
+      return;
+    }
+
+    const maxVal = Math.max(...Object.values(breakdown), 1);
+    const sorted = Object.entries(breakdown).sort((a, b) => b[1] - a[1]);
+    sorted.forEach(([device, count]) => {
+      const pct = (count / maxVal * 100).toFixed(1);
+      const row = document.createElement("div");
+      row.className = "bar-row";
+      row.innerHTML = `
+        <div class="bar-label">${device}</div>
+        <div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>
+        <div class="bar-count">${count}</div>
+      `;
+      container.appendChild(row);
+    });
+
+    meta.textContent = `Window: ${deviceBreakdown.windowEnd || "-"} | Total: ${deviceBreakdown.total || 0}`;
+  }
+
+  function renderTrafficSpike(spike, trafficEvents) {
+    const countEl = document.getElementById("traffic-count");
+    const metaEl = document.getElementById("traffic-meta");
+    const recentEl = document.getElementById("traffic-recent");
+
+    const count = spike?.eventCount ?? 0;
+    const threshold = spike?.threshold ?? 0;
+    const isSpike = Boolean(spike?.isSpike);
+
+    countEl.textContent = String(count);
+    countEl.classList.toggle("alert", isSpike);
+    countEl.classList.toggle("safe", !isSpike);
+
+    metaEl.textContent = `Window: ${spike?.windowEnd || "-"} | Threshold: ${threshold}`;
+
+    if (!trafficEvents || trafficEvents.length === 0) {
+      recentEl.innerHTML = '<p style="color:#484f58;">No traffic windows yet.</p>';
+      return;
+    }
+
+    recentEl.innerHTML = "";
+    [...trafficEvents].reverse().slice(0, 8).forEach(item => {
+      const row = document.createElement("div");
+      row.className = "tiny-row";
+      const ts = item?.windowEnd || "-";
+      const c = item?.eventCount ?? "-";
+      row.innerHTML = `<span>${ts}</span><span>${c}</span>`;
+      recentEl.appendChild(row);
     });
   }
 

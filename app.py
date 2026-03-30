@@ -39,11 +39,16 @@ CORS(app)
 # On Azure App Service, set them as Application Settings in the portal.
 # ---------------------------------------------------------------------------
 CONNECTION_STR = os.environ.get("EVENT_HUB_CONNECTION_STR", "")
-EVENT_HUB_NAME = os.environ.get("EVENT_HUB_NAME", "clickstream")
+CLICK_EVENT_HUB_NAME = os.environ.get("EVENT_HUB_NAME", "clickstream")
+DEVICE_EVENT_HUB_NAME = os.environ.get("DEVICE_EVENT_HUB_NAME", "stream-analytics-results")
+TRAFFIC_EVENT_HUB_NAME = os.environ.get("TRAFFIC_EVENT_HUB_NAME", "stream-analytics-spikes")
+TRAFFIC_SPIKE_THRESHOLD = int(os.environ.get("TRAFFIC_SPIKE_THRESHOLD", "20"))
 
 # In-memory buffer: stores the last 50 events received by the consumer thread.
 # In a production system you would query a database or Azure Stream Analytics output.
 _event_buffer = []
+_device_event_buffer = []
+_traffic_event_buffer = []
 _buffer_lock = threading.Lock()
 MAX_BUFFER = 50
 
@@ -62,7 +67,7 @@ def send_to_event_hubs(event_dict: dict):
     # In a high-throughput production app you would keep a shared client instance.
     producer = EventHubProducerClient.from_connection_string(
         conn_str=CONNECTION_STR,
-        eventhub_name=EVENT_HUB_NAME,
+        eventhub_name=CLICK_EVENT_HUB_NAME,
     )
     with producer:
         # create_batch() lets the SDK manage event size limits automatically
@@ -92,42 +97,144 @@ def _on_event(partition_context, event):
     partition_context.update_checkpoint(event)
 
 
-def start_consumer():
-    """Start the Event Hubs consumer in a background daemon thread.
+def _on_device_event(partition_context, event):
+    """Callback invoked for device-type breakdown events."""
+    body = event.body_as_str(encoding="UTF-8")
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        data = {"raw": body}
+
+    with _buffer_lock:
+        _device_event_buffer.append(data)
+        if len(_device_event_buffer) > MAX_BUFFER:
+            _device_event_buffer.pop(0)
+
+    partition_context.update_checkpoint(event)
+
+
+def _on_traffic_event(partition_context, event):
+    """Callback invoked for traffic spike detection events."""
+    body = event.body_as_str(encoding="UTF-8")
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        data = {"raw": body}
+
+    with _buffer_lock:
+        # Some jobs emit an array with one-or-more window records.
+        if isinstance(data, list):
+            for item in data:
+                _traffic_event_buffer.append(item)
+        else:
+            _traffic_event_buffer.append(data)
+
+        while len(_traffic_event_buffer) > MAX_BUFFER:
+            _traffic_event_buffer.pop(0)
+
+    partition_context.update_checkpoint(event)
+
+
+def _start_consumer_for_hub(eventhub_name, on_event_callback, stream_label):
+    """Start an Event Hubs consumer thread for a single hub."""
+    if not CONNECTION_STR:
+        app.logger.warning("EVENT_HUB_CONNECTION_STR is not set – %s consumer not started", stream_label)
+        return
+
+    consumer = EventHubConsumerClient.from_connection_string(
+        conn_str=CONNECTION_STR,
+        consumer_group="$Default",
+        eventhub_name=eventhub_name,
+    )
+
+    def run():
+        with consumer:
+            consumer.receive(
+                on_event=on_event_callback,
+                starting_position="-1",
+            )
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    app.logger.info("Event Hubs consumer thread started for %s (%s)", stream_label, eventhub_name)
+
+
+def _build_device_breakdown(device_events):
+    """Aggregate latest device-type window events into a compact summary."""
+    latest_window_end = None
+    breakdown = {}
+
+    # Iterate newest-to-oldest so we can stop at the latest complete window.
+    for item in reversed(device_events):
+        if not isinstance(item, dict):
+            continue
+
+        device_type = item.get("deviceType")
+        event_count = item.get("eventCount")
+        window_end = item.get("windowEnd")
+        if not device_type or window_end is None or event_count is None:
+            continue
+
+        if latest_window_end is None:
+            latest_window_end = window_end
+        if window_end != latest_window_end:
+            continue
+
+        try:
+            count = int(event_count)
+        except (TypeError, ValueError):
+            continue
+
+        breakdown[device_type] = breakdown.get(device_type, 0) + count
+
+    return {
+        "windowEnd": latest_window_end,
+        "breakdown": breakdown,
+        "total": sum(breakdown.values()),
+    }
+
+
+def _build_traffic_spike_summary(traffic_events):
+    """Aggregate latest traffic window and evaluate spike status."""
+    latest_window_end = None
+    latest_count = 0
+
+    for item in reversed(traffic_events):
+        if not isinstance(item, dict):
+            continue
+
+        event_count = item.get("eventCount")
+        window_end = item.get("windowEnd")
+        if window_end is None or event_count is None:
+            continue
+
+        try:
+            count = int(event_count)
+        except (TypeError, ValueError):
+            continue
+
+        latest_window_end = window_end
+        latest_count = count
+        break
+
+    return {
+        "windowEnd": latest_window_end,
+        "eventCount": latest_count,
+        "threshold": TRAFFIC_SPIKE_THRESHOLD,
+        "isSpike": latest_count >= TRAFFIC_SPIKE_THRESHOLD,
+    }
+
+
+def start_consumers():
+    """Start Event Hubs consumers in background daemon threads.
 
     The consumer must run on a separate thread because consumer.receive() blocks
     forever waiting for events. Running it on the main thread would freeze Flask
     and make the web server unable to handle any HTTP requests.
     """
-    if not CONNECTION_STR:
-        app.logger.warning("EVENT_HUB_CONNECTION_STR is not set – consumer thread not started")
-        return
-
-    # $Default is the built-in consumer group every Event Hub has.
-    # A consumer group is a logical "view" of the stream — multiple groups can
-    # read the same events independently (e.g. one for analytics, one for alerts).
-    consumer = EventHubConsumerClient.from_connection_string(
-        conn_str=CONNECTION_STR,
-        consumer_group="$Default",
-        eventhub_name=EVENT_HUB_NAME,
-    )
-
-    def run():
-        with consumer:
-            # receive() blocks forever, calling _on_event for each new event.
-            # starting_position="-1" means "start from the beginning of the stream",
-            # not just events that arrive after this consumer connects.
-            consumer.receive(
-                on_event=_on_event,
-                starting_position="-1",
-            )
-
-    # daemon=True means this thread is automatically killed when the main program
-    # exits. Without it, Flask would hang on shutdown waiting for receive() to
-    # return — which it never would.
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    app.logger.info("Event Hubs consumer thread started")
+    _start_consumer_for_hub(CLICK_EVENT_HUB_NAME, _on_event, "clickstream")
+    _start_consumer_for_hub(DEVICE_EVENT_HUB_NAME, _on_device_event, "device-type")
+    _start_consumer_for_hub(TRAFFIC_EVENT_HUB_NAME, _on_traffic_event, "traffic-spike")
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +321,8 @@ def get_events():
 
     with _buffer_lock:
         recent = list(_event_buffer[-limit:])
+        recent_device = list(_device_event_buffer[-limit:])
+        recent_traffic = list(_traffic_event_buffer[-limit:])
 
     # Build a simple summary for the dashboard
     summary = {}
@@ -221,7 +330,42 @@ def get_events():
         et = e.get("event_type", "unknown")
         summary[et] = summary.get(et, 0) + 1
 
-    return jsonify({"events": recent, "summary": summary, "total": len(recent)}), 200
+    return jsonify(
+        {
+            "events": recent,
+            "summary": summary,
+            "total": len(recent),
+            "device_events": recent_device,
+            "traffic_events": recent_traffic,
+        }
+    ), 200
+
+
+@app.route("/api/insights", methods=["GET"])
+def get_insights():
+    """Return latest device breakdown and traffic-spike streams."""
+    try:
+        limit = min(int(request.args.get("limit", 20)), MAX_BUFFER)
+    except ValueError:
+        limit = 20
+
+    with _buffer_lock:
+        recent_device = list(_device_event_buffer[-limit:])
+        recent_traffic = list(_traffic_event_buffer[-limit:])
+
+    device_breakdown = _build_device_breakdown(recent_device)
+    traffic_spike = _build_traffic_spike_summary(recent_traffic)
+
+    return jsonify(
+        {
+            "device_events": recent_device,
+            "traffic_events": recent_traffic,
+            "device_total": len(recent_device),
+            "traffic_total": len(recent_traffic),
+            "device_breakdown": device_breakdown,
+            "traffic_spike": traffic_spike,
+        }
+    ), 200
 
 
 def determine_device_type(ua, ch_mobile):
@@ -239,6 +383,6 @@ def determine_device_type(ua, ch_mobile):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     # Start the background consumer so the dashboard receives live events
-    start_consumer()
+    start_consumers()
     # Run on 0.0.0.0 so it is reachable both locally and inside Azure App Service
     app.run(debug=False, host="0.0.0.0", port=8000)
