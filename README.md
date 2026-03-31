@@ -7,6 +7,14 @@
 
 ---
 
+## AI Usage Disclosure
+
+- Github Copilot was used on this file to:
+  - Add stream analytics to the architecture diagram
+  - List steps for creating a new stream analytics job
+
+---
+
 ## Demo Video
 
 🎥 [Watch Demo Video](https://youtu.be/dQu5iWIHppU)

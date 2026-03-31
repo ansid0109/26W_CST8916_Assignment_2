@@ -10,6 +10,11 @@
 #   GET  /dashboard     → serves the live analytics dashboard (dashboard.html)
 #   GET  /api/events    → returns recent events as JSON (polled by the dashboard)
 
+"""
+AI Usage Disclosure: Github Copilot was used on this file to generate code for consumers,
+and daemon threads used in consuming the new events.
+"""
+
 import os
 import json
 import threading
