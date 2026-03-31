@@ -13,28 +13,47 @@ flowchart LR
             direction TB
             Track["/track\nsend_to_event_hubs()"]
             API["/api/events\n_event_buffer"]
-            Consumer["Background Consumer Thread\nEventHubConsumerClient"]
+            APIInsights["/api/insights\n_device_event_buffer + _traffic_event_buffer"]
+            ConsumerClick["Consumer: clickstream\nEventHubConsumerClient"]
+            ConsumerInsights["Consumers: device + traffic\nEventHubConsumerClient"]
         end
 
         Store -->|"POST /track"| Track
         API -->|"JSON response"| Dashboard
+        APIInsights -->|"JSON response"| Dashboard
         Dashboard -->|"polls every 2 s\nGET /api/events"| API
+        Dashboard -->|"polls every 2 s\nGET /api/insights"| APIInsights
     end
 
     subgraph EH["☁️ Azure Event Hubs"]
         direction TB
         NS["Namespace: shopstream"]
         Hub["Event Hub: clickstream"]
+        HubDevice["Event Hub: stream-analytics-results"]
+        HubTraffic["Event Hub: stream-analytics-spikes"]
         P0["Partition 0"]
         P1["Partition 1"]
         NS --> Hub
+        NS --> HubDevice
+        NS --> HubTraffic
         Hub --> P0
         Hub --> P1
     end
 
-    Track -->|"azure-eventhub SDK\npublish event"| EH
-    EH -->|"read events\ncontinuously"| Consumer
-    Consumer -->|"append to buffer"| API
+    subgraph ASA["☁️ Azure Stream Analytics"]
+        direction TB
+        SAJob["Job: device + spike analytics"]
+    end
+
+    Track -->|"azure-eventhub SDK\npublish click events"| Hub
+    Hub -->|"input stream"| SAJob
+    SAJob -->|"output: device windows"| HubDevice
+    SAJob -->|"output: traffic windows"| HubTraffic
+    Hub -->|"read clickstream\ncontinuously"| ConsumerClick
+    HubDevice -->|"read device events"| ConsumerInsights
+    HubTraffic -->|"read traffic events"| ConsumerInsights
+    ConsumerClick -->|"append to buffer"| API
+    ConsumerInsights -->|"append to buffers"| APIInsights
 
     %% ── Colour palette ──────────────────────────────────────────────
     %% Frontend (warm amber)
@@ -45,7 +64,9 @@ flowchart LR
     style Flask     fill:#E3F2FD,stroke:#1565C0,color:#212121,stroke-width:2px
     style Track     fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:1.5px
     style API       fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:1.5px
-    style Consumer  fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:1.5px
+    style APIInsights fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:1.5px
+    style ConsumerClick fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:1.5px
+    style ConsumerInsights fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:1.5px
 
     %% App Service container (light grey)
     style AAS       fill:#F5F5F5,stroke:#616161,color:#212121,stroke-width:2px
@@ -54,8 +75,14 @@ flowchart LR
     style EH        fill:#F3E5F5,stroke:#6A1B9A,color:#212121,stroke-width:2px
     style NS        fill:#E1BEE7,stroke:#6A1B9A,color:#212121,stroke-width:1.5px
     style Hub       fill:#CE93D8,stroke:#6A1B9A,color:#212121,stroke-width:1.5px
+    style HubDevice fill:#CE93D8,stroke:#6A1B9A,color:#212121,stroke-width:1.5px
+    style HubTraffic fill:#CE93D8,stroke:#6A1B9A,color:#212121,stroke-width:1.5px
     style P0        fill:#BA68C8,stroke:#6A1B9A,color:#FFFFFF,stroke-width:1.5px
     style P1        fill:#BA68C8,stroke:#6A1B9A,color:#FFFFFF,stroke-width:1.5px
+
+    %% Stream Analytics (teal)
+    style ASA       fill:#E0F2F1,stroke:#00695C,color:#212121,stroke-width:2px
+    style SAJob     fill:#B2DFDB,stroke:#00695C,color:#212121,stroke-width:1.5px
 ```
 
 ---
