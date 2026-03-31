@@ -1,5 +1,18 @@
 # CST8916 Assignment 2
 
+**Student Name**: Anoop Sidhu
+**Student ID**: 040984994
+**Course**: CST8916 Remote Data and Real-Time Applications
+**Semester**: Winter 2026
+
+---
+
+## Demo Video
+
+🎥 [Watch Demo Video](https://youtu.be/dQu5iWIHppU)
+
+---
+
 ## Architecture
 
 ```mermaid
@@ -87,18 +100,27 @@ flowchart LR
 
 ---
 
+## Design Decisions
+
+- Event Enrichment: Three new fields added to `clickstream` event structure, `deviceType`, `browser`, `os`
+- Enrichment Approach: Parsed request headers `Sec-CH-UA`, `Sec-CH-UA-Mobile` and `Sec-CH-UA-Platform` to determine the above fields
+- Added stream analytics job to analyze `clickstream` data
+- Job aggregates events by `deviceType` and detects if there have been more than `20 events per minute`
+- Job then outputs aggregations as events in event hub, in a separate stream
+- Dashboard connects to event hubs mentioned above by daemon threads, similar to original consumer
+- Dashboard picks up new events and shows relevant data on the dashboard
+
+---
+
 ## Prerequisites
 
 - Python 3.x and pip installed
 - An **Azure account** (free tier is fine)
 - **Azure CLI** installed — [install guide](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
-- VS Code with the **REST Client** extension (optional)
 
 ---
 
 ## Part 1: Create the Azure Event Hubs Namespace
-
-An **Event Hubs Namespace** is a container that holds one or more Event Hubs (similar to how a database server holds multiple databases).
 
 ### Step 1 – Log in to the Azure Portal
 
@@ -143,110 +165,66 @@ Event Hubs Namespace: shopstream-<your-name>
     └── Partition 1  ← other events land here
 ```
 
-### Step 5 – Copy the Connection String
+### Step 5 – Create an Azure Stream Analytics job (device + spike outputs)
+
+1. In Azure Portal, search for **Stream Analytics jobs** and click **Create**.
+2. Fill in:
+    - **Subscription:** your subscription
+    - **Resource group:** `cst8916-week10-rg`
+    - **Job name:** `shopstream-analytics`
+    - **Region:** `Canada Central`
+3. Click **Review + create** → **Create**.
+4. Open the job and add **Input**:
+    - **Input alias:** `clickstream_input`
+    - **Source type:** Data stream
+    - **Source:** Event Hub
+    - **Event Hub name:** `clickstream`
+5. In your Event Hubs namespace, create two additional Event Hubs for job outputs:
+    - `stream-analytics-results`
+    - `stream-analytics-spikes`
+6. Add two **Outputs** in Stream Analytics:
+    - **Output alias:** `device_results` → Event Hub `stream-analytics-results`
+    - **Output alias:** `traffic_spikes` → Event Hub `stream-analytics-spikes`
+7. In **Query**, paste a multi-output query like this:
+
+```sql
+SELECT
+    deviceType,
+    COUNT(*) AS eventCount,
+    System.Timestamp() AS windowEnd
+INTO
+    [clickstream-output]
+FROM
+    clickstream TIMESTAMP BY EventEnqueuedUtcTime
+WHERE
+    deviceType <> 'unknown'
+    AND deviceType <> '?0'
+GROUP BY
+    deviceType,
+    TumblingWindow(minute, 1)
+
+SELECT
+    COUNT(*) AS eventCount,
+    System.Timestamp() AS windowEnd
+INTO
+    [clickstream-spikes]
+FROM
+    clickstream TIMESTAMP BY EventEnqueuedUtcTime
+GROUP BY
+    TumblingWindow(minute, 1)
+HAVING
+    COUNT(*) > 20
+```
+
+8. Click **Start** on the Stream Analytics job.
+
+### Step 6 – Copy the Connection String
 
 1. In the namespace, go to **Shared access policies** (left menu).
 2. Click **RootManageSharedAccessKey**.
 3. Copy the **Primary connection string** — you will need it in Part 2.
 
-> **Security note:** A connection string contains a secret key. Never commit it to Git. You will store it as an environment variable.
-
 ---
-
-## Part 2: Run the App Locally
-
-### Step 1 – Clone and install
-
-```bash
-git clone https://github.com/YOUR-USERNAME/26W_CST8916_Week10-Event-Hubs-Lab.git
-cd 26W_CST8916_Week10-Event-Hubs-Lab
-pip install -r requirements.txt
-```
-
-### Step 2 – Set environment variables
-
-**Linux / macOS:**
-```bash
-export EVENT_HUB_CONNECTION_STR="Endpoint=sb://shopstream-<your-name>.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=<your-key>"
-export EVENT_HUB_NAME="clickstream"
-```
-
-**Windows (PowerShell):**
-```powershell
-$env:EVENT_HUB_CONNECTION_STR="Endpoint=sb://shopstream-<your-name>.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=<your-key>"
-$env:EVENT_HUB_NAME="clickstream"
-```
-
-> Never put your connection string directly in the code. The app reads it from the environment so secrets stay out of source control.
-
-### Step 3 – Run the app
-
-```bash
-python app.py
-```
-
-You should see:
-```
-Event Hubs consumer thread started
- * Running on http://0.0.0.0:8000
-```
-
-### Step 4 – Try it out
-
-1. Open `http://localhost:8000` — the ShopStream store loads.
-2. Click on products, add items to cart, click the banner.
-3. Watch the **Event Stream Log** at the bottom of the store page — each click shows as `→ sent to Event Hubs`.
-4. Open `http://localhost:8000/dashboard` — the live dashboard updates every 2 seconds.
-
----
-
-## Part 3: Understanding the Code
-
-### How an event travels from click to Event Hubs
-
-```mermaid
-flowchart TD
-    S1["1️⃣ User clicks 'Add to Cart'\non the store page"]
-    S2["2️⃣ JavaScript calls\ntrackEvent('add_to_cart', '/products/shoes', 'p_shoe_01')"]
-    S3["3️⃣ fetch() sends POST /track\nwith JSON body:\nevent_type, page, product_id, user_id"]
-    S4["4️⃣ Flask /track route enriches the event\n(adds timestamp)\nand calls send_to_event_hubs()"]
-    S5["5️⃣ EventHubProducerClient\ncreates a batch and sends it\nto Azure Event Hubs"]
-    S6["6️⃣ Event Hubs stores the event\nin one of its partitions"]
-    S7["7️⃣ Background consumer thread\nreads the event via\nEventHubConsumerClient"]
-    S8["8️⃣ _on_event() appends the event\nto the in-memory buffer"]
-    S9["9️⃣ Dashboard polls GET /api/events\nand renders the updated\nevent feed and bar chart"]
-
-    S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7 --> S8 --> S9
-
-    %% ── Colour palette ──────────────────────────────────
-    %% Browser / Frontend (warm amber)
-    style S1 fill:#FFF3E0,stroke:#E65100,color:#212121,stroke-width:2px
-    style S2 fill:#FFF3E0,stroke:#E65100,color:#212121,stroke-width:2px
-    style S3 fill:#FFF3E0,stroke:#E65100,color:#212121,stroke-width:2px
-
-    %% Flask application logic (cool blue)
-    style S4 fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:2px
-    style S5 fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:2px
-
-    %% Azure Event Hubs (purple)
-    style S6 fill:#E1BEE7,stroke:#6A1B9A,color:#212121,stroke-width:2px
-
-    %% Background consumer + buffer (cool blue)
-    style S7 fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:2px
-    style S8 fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:2px
-
-    %% Dashboard / Frontend (warm amber)
-    style S9 fill:#FFF3E0,stroke:#E65100,color:#212121,stroke-width:2px
-```
-
-### Key SDK classes (from `azure-eventhub`)
-
-| Class | Role |
-|-------|------|
-| `EventHubProducerClient` | Sends events to Event Hubs |
-| `EventHubConsumerClient` | Reads events from Event Hubs |
-| `EventData` | Wraps a single event payload (bytes or string) |
-| `create_batch()` | Groups multiple events into one efficient send operation |
 
 ### Event payload structure
 
@@ -257,13 +235,16 @@ flowchart TD
   "product_id": "p_shoe_01",
   "user_id": "u_4a2f",
   "session_id": "s_9b3e",
-  "timestamp": "2026-03-18T14:22:05.123456+00:00"
+  "timestamp": "2026-03-18T14:22:05.123456+00:00",
+  "deviceType": "desktop",
+  "browser": "Chrome",
+  "os": "Windows"
 }
 ```
 
 ---
 
-## Part 4: Deploy to Azure App Service
+## Part 2: Deploy to Azure App Service
 
 You will deploy the app directly from your GitHub fork using Azure App Service's built-in GitHub integration — no CLI required.
 
@@ -287,7 +268,7 @@ You will deploy the app directly from your GitHub fork using Azure App Service's
 
 5. Click **Next: Deployment →**.
 
-### Step 4 – Connect your GitHub fork
+### Step 2 – Connect your GitHub fork
 
 On the **Deployment** tab:
 
@@ -299,7 +280,7 @@ On the **Deployment** tab:
    - **Branch:** `main`
 4. Click **Review + create** → **Create**.
 
-### Step 5 – Set Application Settings (environment variables)
+### Step 3 – Set Application Settings (environment variables)
 
 The app reads the Event Hubs connection string from environment variables. You set these in the portal so the secret never lives in your code or repository.
 
@@ -316,7 +297,7 @@ The app reads the Event Hubs connection string from environment variables. You s
 
 3. Click **Apply** → **Confirm**.
 
-### Step 6 – Set the startup command
+### Step 4 – Set the startup command
 
 Azure App Service needs to know how to start the Flask app using Gunicorn (the production web server).
 
@@ -327,7 +308,7 @@ Azure App Service needs to know how to start the Flask app using Gunicorn (the p
    ```
 3. Click **Apply**.
 
-### Step 7 – Verify the deployment
+### Step 5 – Verify the deployment
 
 1. Go to your repository on GitHub → **Actions** tab.
 2. You should see a workflow run in progress or completed. Click it to watch the build logs.
